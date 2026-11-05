@@ -770,6 +770,8 @@ function coverageStatus(c) {
   return '🟣 Critical';
 }
 
+const LS_PSI_SIM = 'caldera_psi_simulator_manual_wip';
+
 function toISOInv(d) { return d?.replace(/\//g, '-'); }
 
 // WIP planned releases per item, keyed by ISO date of the week's Monday (CW40–CW1 2027)
@@ -1010,6 +1012,86 @@ function InventoryFGSS({ data, salesData, psiData }) {
     });
   }, [allFGItems, kpiRows, fgLots, projWeeks]);
 
+  // ── PSI Simulator: same projection + manual WIP adjustments ─────────────
+  // Manual quantities per item per week (strings while typing; + adds, − removes WIP).
+  const [manualWip, setManualWip] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(LS_PSI_SIM) || '{}') || {}; } catch { return {}; }
+  });
+  const updateManualWip = (next) => {
+    setManualWip(next);
+    try { localStorage.setItem(LS_PSI_SIM, JSON.stringify(next)); } catch { /* storage unavailable */ }
+  };
+  const setManualCell = (item, dateStr, raw) => {
+    const next = { ...manualWip, [item]: { ...(manualWip[item] || {}) } };
+    if (raw === '' || raw == null) delete next[item][dateStr];
+    else next[item][dateStr] = raw;
+    if (Object.keys(next[item]).length === 0) delete next[item];
+    updateManualWip(next);
+  };
+  const manualQty = (item, dateStr) => {
+    const v = Number(manualWip[item]?.[dateStr]);
+    return Number.isFinite(v) ? v : 0;
+  };
+  const manualCount = Object.values(manualWip).reduce((n, m) => n + Object.values(m).filter(v => Number(v)).length, 0);
+
+  // Identical rules to projectionRows; only difference: WIP this week = planned + manual.
+  // Net WIP > 0 is added as a non-expiring lot; net WIP < 0 is removed from stock (FEFO).
+  const simRows = useMemo(() => {
+    return allFGItems.map(item => {
+      const avgDemand    = kpiRows.find(r => r.item === item)?.avgDemand || 0;
+      const weeklyDemand = avgDemand * 12 / 52;
+      const itemWIP      = WIP[item] || {};
+      const projStart    = projWeeks[0];
+      const minExpiryAtStart = new Date(projStart.getTime() + 195 * 24 * 60 * 60 * 1000);
+
+      let runningLots = fgLots
+        .filter(l => l.item === item && (l.expiry === null || l.expiry > minExpiryAtStart))
+        .map(l => ({ qty: l.qty, expiry: l.expiry }));
+
+      const fefo = (a, b) => {
+        if (a.expiry === null && b.expiry === null) return 0;
+        if (a.expiry === null) return 1;
+        if (b.expiry === null) return -1;
+        return a.expiry - b.expiry;
+      };
+      const consume = (qty) => {
+        let left = qty;
+        for (const lot of runningLots) {
+          if (left <= 0) break;
+          const c = Math.min(lot.qty, left);
+          lot.qty -= c;
+          left -= c;
+        }
+      };
+
+      const weeks = projWeeks.map((weekStart) => {
+        const weekDateStr = weekStart.getFullYear() + '-' +
+          String(weekStart.getMonth()+1).padStart(2,'0') + '-' +
+          String(weekStart.getDate()).padStart(2,'0');
+
+        const weekThreshold = new Date(weekStart.getTime() + 195 * 24 * 60 * 60 * 1000);
+        runningLots = runningLots.filter(l => l.expiry === null || l.expiry > weekThreshold);
+
+        const plannedWip = itemWIP[weekDateStr] || 0;
+        const manual     = manualQty(item, weekDateStr);
+        const netWip     = plannedWip + manual;
+
+        if (netWip > 0) runningLots.push({ qty: netWip, expiry: null });
+        runningLots.sort(fefo);
+        if (netWip < 0) consume(-netWip);
+
+        consume(weeklyDemand);
+        runningLots = runningLots.filter(l => l.qty > 0);
+
+        const qualifyingStock = runningLots.reduce((s, l) => s + l.qty, 0);
+        const coverage = avgDemand > 0 ? +(qualifyingStock / avgDemand).toFixed(2) : null;
+        return { dateStr: weekDateStr, netStock: +qualifyingStock.toFixed(0), coverage, plannedWip, manual };
+      });
+      return { item, avgDemand, weeklyDemand: +weeklyDemand.toFixed(1), weeks };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allFGItems, kpiRows, fgLots, projWeeks, WIP, manualWip]);
+
   // ── Summary counts ────────────────────────────────────────────────────────
   const critical  = kpiRows.filter(r => r.coverage !== null && (r.coverage < SS_ORA_LOW || r.coverage > SS_ORA_HIGH)).length;
   const belowTgt  = kpiRows.filter(r => r.coverage !== null && r.coverage >= SS_ORA_LOW && r.coverage < SS_GREEN_MIN).length;
@@ -1235,6 +1317,112 @@ function InventoryFGSS({ data, salesData, psiData }) {
                       <div style={{ fontWeight: 700, fontSize: 12, color: '#93c5fd' }}>
                         {total.toLocaleString()} u
                       </div>
+                    </td>
+                  ))}
+                </tr>
+              );
+            })()}
+          </tbody>
+        </table>
+      </div>
+
+      {/* ── PSI Simulator (copy of the 26-week projection + manual WIP) ── */}
+      <div id="inv-psi-sim" style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 4 }}>
+        <div style={{ color: '#f1f5f9', fontSize: 15, fontWeight: 700 }}>🧮 PSI Simulator</div>
+        <div style={{ color: '#64748b', fontSize: 12 }}>
+          {manualCount} manual adjustment{manualCount !== 1 ? 's' : ''}
+        </div>
+        {manualCount > 0 && (
+          <button
+            onClick={() => { if (window.confirm('Clear all manual WIP quantities?')) updateManualWip({}); }}
+            style={clearBtn}>
+            Reset all manual WIP
+          </button>
+        )}
+      </div>
+      <div style={{ color: '#64748b', fontSize: 11, marginBottom: 10 }}>
+        Same rules as the 26-week projection above · type a manual WIP quantity in any week:
+        <span style={{ color: '#60a5fa' }}> positive = add</span>, <span style={{ color: '#f87171' }}>negative = remove</span> ·
+        clear the field to remove the adjustment · values are saved in this browser
+      </div>
+      <div style={{ overflowX: 'auto', marginBottom: 32 }}>
+        <table style={{ borderCollapse: 'collapse', minWidth: 'max-content' }}>
+          <thead>
+            <tr style={{ background: '#1e293b' }}>
+              <th style={{ ...th2, position: 'sticky', left: 0, background: '#1e293b', zIndex: 2 }}>Item</th>
+              <th style={{ ...th2, position: 'sticky', left: 80, background: '#1e293b', zIndex: 2, minWidth: 160 }}>Description</th>
+              <th style={{ ...th2, whiteSpace: 'nowrap' }}>Avg/m</th>
+              <th style={{ ...th2, whiteSpace: 'nowrap' }}>Avg/wk</th>
+              {projWeekLabels.map((lbl, n) => (
+                <th key={n} style={{ ...th2, whiteSpace: 'pre', textAlign: 'center', minWidth: 80, lineHeight: 1.3 }}>{lbl}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {simRows.map((r, i) => {
+              const bg = i % 2 === 0 ? '#0f172a' : '#1e293b';
+              return (
+                <tr key={r.item} style={{ background: bg }}>
+                  <td style={{ ...td2, fontWeight: 700, position: 'sticky', left: 0, background: bg, zIndex: 1 }}>{r.item}</td>
+                  <td style={{ ...td2, color: '#94a3b8', position: 'sticky', left: 80, background: bg, zIndex: 1, minWidth: 160 }}>{itemDesc[r.item] || ''}</td>
+                  <td style={{ ...td2, whiteSpace: 'nowrap' }}>{r.avgDemand.toLocaleString()}</td>
+                  <td style={{ ...td2, whiteSpace: 'nowrap' }}>{r.weeklyDemand.toLocaleString()}</td>
+                  {r.weeks.map((w, n) => {
+                    const raw = manualWip[r.item]?.[w.dateStr] ?? '';
+                    return (
+                      <td key={n} style={{ ...td2, textAlign: 'center', padding: '4px 6px', verticalAlign: 'top' }}>
+                        <div style={{
+                          background: w.coverage !== null ? coverageColor(w.coverage) + '22' : 'transparent',
+                          borderRadius: 5, padding: '3px 6px',
+                          border: `1px solid ${w.manual ? '#60a5fa' : (w.coverage !== null ? coverageColor(w.coverage) + '55' : '#334155')}`,
+                          minWidth: 68,
+                        }}>
+                          <div style={{ color: coverageColor(w.coverage), fontWeight: 700, fontSize: 12 }}>
+                            {w.coverage !== null ? `${w.coverage}m` : '—'}
+                          </div>
+                          <div style={{ color: '#64748b', fontSize: 10 }}>{w.netStock.toLocaleString()} u</div>
+                          {w.plannedWip > 0 && (
+                            <div style={{ color: '#34d399', fontSize: 10, fontWeight: 600 }}>+{w.plannedWip.toLocaleString()} WIP</div>
+                          )}
+                          <input
+                            type="number"
+                            step="1"
+                            value={raw}
+                            placeholder="± WIP"
+                            title={`Manual WIP for ${r.item} — week of ${w.dateStr}`}
+                            data-item={r.item}
+                            data-week={w.dateStr}
+                            onChange={e => setManualCell(r.item, w.dateStr, e.target.value)}
+                            style={{
+                              width: 62, marginTop: 3, padding: '2px 4px', fontSize: 11, textAlign: 'right',
+                              background: '#0b1220', border: '1px solid #334155', borderRadius: 4,
+                              color: w.manual > 0 ? '#60a5fa' : w.manual < 0 ? '#f87171' : '#e2e8f0',
+                            }}
+                          />
+                        </div>
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
+            {(() => {
+              const weekTotals = projWeeks.map((_, n) => simRows.reduce((sum, r) => sum + (r.weeks[n]?.netStock || 0), 0));
+              const manualTotals = projWeeks.map((_, n) => simRows.reduce((sum, r) => sum + (r.weeks[n]?.manual || 0), 0));
+              return (
+                <tr style={{ background: '#1e3a5f', borderTop: '2px solid #3b82f6' }}>
+                  <td style={{ ...td2, fontWeight: 700, color: '#93c5fd', position: 'sticky', left: 0, background: '#1e3a5f', zIndex: 1 }}>TOTAL</td>
+                  <td style={{ ...td2, position: 'sticky', left: 80, background: '#1e3a5f', zIndex: 1 }} />
+                  <td style={td2} />
+                  <td style={td2} />
+                  {weekTotals.map((total, n) => (
+                    <td key={n} style={{ ...td2, textAlign: 'center', padding: '4px 6px' }}>
+                      <div style={{ fontWeight: 700, fontSize: 12, color: '#93c5fd' }}>{total.toLocaleString()} u</div>
+                      {manualTotals[n] !== 0 && (
+                        <div style={{ fontSize: 10, fontWeight: 600, color: manualTotals[n] > 0 ? '#60a5fa' : '#f87171' }}>
+                          {manualTotals[n] > 0 ? '+' : ''}{manualTotals[n].toLocaleString()} manual
+                        </div>
+                      )}
                     </td>
                   ))}
                 </tr>
